@@ -3,6 +3,43 @@ const net = std.net;
 const posix = std.posix;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
+// --- EXTREME SIZE OPTIMIZATIONS ---
+
+// 1. Custom panic handler removes stack trace unwinding and formatting bloat.
+pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
+    _ = msg;
+    _ = trace;
+    _ = ret_addr;
+    posix.exit(1);
+}
+
+// 2. Tiny print helpers replace std.debug.print (removes ~60KB of std.fmt bloat).
+fn printOut(msg: []const u8) void {
+    _ = posix.write(posix.STDOUT_FILENO, msg) catch {};
+}
+
+fn printErr(msg: []const u8) void {
+    _ = posix.write(posix.STDERR_FILENO, msg) catch {};
+}
+
+fn printRcode(rcode: u16) void {
+    if (rcode == 0) {
+        printOut("NOERROR\n");
+    } else {
+        printErr("RCODE: ");
+        var buf: [2]u8 = undefined;
+        if (rcode < 10) {
+            buf[0] = '0' + @as(u8, @intCast(rcode));
+            printErr(buf[0..1]);
+        } else {
+            buf[0] = '0' + @as(u8, @intCast(rcode / 10));
+            buf[1] = '0' + @as(u8, @intCast(rcode % 10));
+            printErr(buf[0..2]);
+        }
+        printErr("\n");
+    }
+}
+
 // --- WIRE FORMAT HELPERS ---
 
 fn writeDomainName(writer: anytype, name: []const u8) !void {
@@ -16,7 +53,6 @@ fn writeDomainName(writer: anytype, name: []const u8) !void {
     try writer.writeByte(0);
 }
 
-/// Skips over a domain name in a DNS packet (handling RFC 1035 pointer compression)
 fn skipName(packet: []const u8, offset: *usize) !void {
     while (offset.* < packet.len) {
         const len = packet[offset.*];
@@ -24,11 +60,9 @@ fn skipName(packet: []const u8, offset: *usize) !void {
             offset.* += 1;
             return;
         } else if ((len & 0xC0) == 0xC0) {
-            // It's a 16-bit pointer to elsewhere in the packet
             offset.* += 2;
             return;
         } else {
-            // It's a standard length-prefixed label
             offset.* += len + 1;
         }
     }
@@ -190,21 +224,23 @@ fn sendUdpPacket(server_ip: []const u8, packet: []const u8, expected_id: u16, op
 
     _ = try posix.sendto(socket, packet, 0, &srv_addr.any, srv_addr.getOsSockLen());
 
-    const bytes_read = posix.recv(socket, resp_buf, 0) catch |err| {
-        std.debug.print("{s} failed: Network error ({!})\n", .{op_name, err});
-        std.process.exit(1);
+    const bytes_read = posix.recv(socket, resp_buf, 0) catch {
+        printErr(op_name);
+        printErr(" failed: Network error\n");
+        posix.exit(1);
     };
 
     if (bytes_read < 12) {
-        std.debug.print("{s} failed: Packet too small\n", .{op_name});
-        std.process.exit(1);
+        printErr(op_name);
+        printErr(" failed: Packet too small\n");
+        posix.exit(1);
     }
 
-    // FIX: strict pointer conversion [0..2]
     const resp_id = std.mem.readInt(u16, resp_buf[0..2][0..2], .big);
     if (resp_id != expected_id) {
-        std.debug.print("{s} failed: Mismatched transaction ID\n", .{op_name});
-        std.process.exit(1);
+        printErr(op_name);
+        printErr(" failed: Mismatched transaction ID\n");
+        posix.exit(1);
     }
 
     return resp_buf[0..bytes_read];
@@ -212,106 +248,107 @@ fn sendUdpPacket(server_ip: []const u8, packet: []const u8, expected_id: u16, op
 
 fn printTxtAnswers(packet: []const u8, qdcount: u16, ancount: u16) !void {
     var offset: usize = 12; // Skip header
-
-    // Skip Question Section
+    
     var i: u16 = 0;
     while (i < qdcount) : (i += 1) {
         try skipName(packet, &offset);
         if (offset + 4 > packet.len) return error.PacketTooShort;
-        offset += 4; // Skip QTYPE and QCLASS
+        offset += 4;
     }
 
-    // Parse Answer Section
     i = 0;
     var found = false;
     while (i < ancount) : (i += 1) {
         try skipName(packet, &offset);
         if (offset + 10 > packet.len) return error.PacketTooShort;
 
-        // FIX: strict pointer conversion [0..2]
         const rtype = std.mem.readInt(u16, packet[offset..][0..2], .big);
         const rdlength = std.mem.readInt(u16, packet[offset+8..][0..2], .big);
         offset += 10;
-
+        
         if (offset + rdlength > packet.len) return error.PacketTooShort;
 
-        if (rtype == 16) { // It's a TXT record
+        if (rtype == 16) { // TXT record
             found = true;
             var txt_offset = offset;
             const txt_end = offset + rdlength;
-
-            std.debug.print("TXT: ", .{});
+            
+            printOut("TXT: ");
             while (txt_offset < txt_end) {
                 const str_len = packet[txt_offset];
                 txt_offset += 1;
                 if (txt_offset + str_len > txt_end) return error.PacketTooShort;
                 const text = packet[txt_offset .. txt_offset + str_len];
-                std.debug.print("\"{s}\" ", .{text});
+                
+                printOut("\"");
+                printOut(text);
+                printOut("\" ");
+                
                 txt_offset += str_len;
             }
-            std.debug.print("\n", .{});
+            printOut("\n");
         }
-
+        
         offset += rdlength;
     }
 
-    if (!found) std.debug.print("No TXT records found.\n", .{});
+    if (!found) printOut("No TXT records found.\n");
 }
 
 // --- MAIN CLI ---
 
-fn printUsage(exe_name: []const u8) void {
-    std.debug.print("Usage:\n", .{});
-    std.debug.print("  {s} lookup <fqdn> <server_ip>\n", .{exe_name});
-    std.debug.print("  {s} update <zone> <fqdn> <txt_value> <key_name> <base64_secret> <server_ip>\n", .{exe_name});
-    std.debug.print("  {s} update -k <key_file> <zone> <fqdn> <txt_value> <server_ip>\n", .{exe_name});
+fn printUsage() void {
+    printErr("Usage:\n");
+    printErr("  zns lookup <fqdn> <server_ip>\n");
+    printErr("  zns update <zone> <fqdn> <txt_value> <key_name> <base64_secret> <server_ip>\n");
+    printErr("  zns update -k <key_file> <zone> <fqdn> <txt_value> <server_ip>\n");
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-
-    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
-    defer arena.deinit();
+    // 3. Switch to c_allocator (since we link libc, this is safe and tiny)
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     const allocator = arena.allocator();
+    // We don't even defer deinit() because the OS will reap memory on exit anyway.
 
     const args = try std.process.argsAlloc(allocator);
     if (args.len < 2) {
-        printUsage(args[0]);
-        std.process.exit(1);
+        printUsage();
+        posix.exit(1);
     }
 
     const mode = args[1];
 
     if (std.mem.eql(u8, mode, "lookup")) {
-        if (args.len != 4) { printUsage(args[0]); std.process.exit(1); }
+        if (args.len != 4) { printUsage(); posix.exit(1); }
         const fqdn = args[2];
         const server_ip = args[3];
-
+        
         var rand_bytes: [2]u8 = undefined;
         std.crypto.random.bytes(&rand_bytes);
         const tx_id = std.mem.readInt(u16, &rand_bytes, .big);
 
         const packet = try buildTxtQuery(allocator, fqdn, tx_id);
-
+        
         var recv_buf: [2048]u8 = undefined;
         const resp = try sendUdpPacket(server_ip, packet, tx_id, "Lookup", &recv_buf);
-
-        // FIX: strict pointer conversion [0..2]
+        
         const flags = std.mem.readInt(u16, resp[2..][0..2], .big);
         const rcode = flags & 0x000F;
-
+        
         if (rcode != 0) {
-            std.debug.print("Lookup failed with RCODE: {d}\n", .{rcode});
-            std.process.exit(1);
+            printErr("Lookup failed! ");
+            printRcode(rcode);
+            posix.exit(1);
         }
 
-        // FIX: strict pointer conversion [0..2]
         const qdcount = std.mem.readInt(u16, resp[4..][0..2], .big);
         const ancount = std.mem.readInt(u16, resp[6..][0..2], .big);
-
-        try printTxtAnswers(resp, qdcount, ancount);
-
+        
+        printTxtAnswers(resp, qdcount, ancount) catch {
+            printErr("Failed to parse response\n");
+            posix.exit(1);
+        };
+        
     } else if (std.mem.eql(u8, mode, "update")) {
         var zone: []const u8 = undefined;
         var fqdn: []const u8 = undefined;
@@ -321,7 +358,7 @@ pub fn main() !void {
         var server_ip: []const u8 = undefined;
 
         if (std.mem.eql(u8, args[2], "-k")) {
-            if (args.len != 8) { printUsage(args[0]); std.process.exit(1); }
+            if (args.len != 8) { printUsage(); posix.exit(1); }
             const tsig_key = try parseTsigKeyFile(allocator, args[3]);
             zone = args[4];
             fqdn = args[5];
@@ -330,7 +367,7 @@ pub fn main() !void {
             key_name = tsig_key.name;
             b64_secret = tsig_key.secret_base64;
         } else {
-            if (args.len != 8) { printUsage(args[0]); std.process.exit(1); }
+            if (args.len != 8) { printUsage(); posix.exit(1); }
             zone = args[2];
             fqdn = args[3];
             txt_value = args[4];
@@ -342,7 +379,10 @@ pub fn main() !void {
         const decoder = std.base64.standard.Decoder;
         const decoded_len = try decoder.calcSizeForSlice(b64_secret);
         const raw_secret = try allocator.alloc(u8, decoded_len);
-        try decoder.decode(raw_secret, b64_secret);
+        decoder.decode(raw_secret, b64_secret) catch {
+            printErr("Invalid base64 secret\n");
+            posix.exit(1);
+        };
 
         var rand_bytes: [2]u8 = undefined;
         std.crypto.random.bytes(&rand_bytes);
@@ -351,18 +391,21 @@ pub fn main() !void {
         const packet = try buildSignedTxtUpdate(
             allocator, zone, fqdn, txt_value, key_name, raw_secret, tx_id
         );
-
+        
         var recv_buf: [1024]u8 = undefined;
         const resp = try sendUdpPacket(server_ip, packet, tx_id, "Update", &recv_buf);
-
-        // FIX: strict pointer conversion [0..2]
+        
         const flags = std.mem.readInt(u16, resp[2..][0..2], .big);
         const rcode = flags & 0x000F;
         if (rcode == 0) {
-            std.debug.print("Update successful! (RCODE: NOERROR)\n", .{});
+            printOut("Update successful! (RCODE: NOERROR)\n");
         } else {
-            std.debug.print("Update failed! RCODE: {d}\n", .{rcode});
-            std.process.exit(1);
+            printErr("Update failed! ");
+            printRcode(rcode);
+            posix.exit(1);
         }
+    } else {
+        printErr("Unknown command\n");
+        posix.exit(1);
     }
 }

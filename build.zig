@@ -7,12 +7,14 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "zns", // Renamed project binary here
+        .name = "zns",
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
 
+    exe.linkLibC();
+    exe.root_module.single_threaded = true;
     exe.root_module.strip = true;
 
     b.installArtifact(exe);
